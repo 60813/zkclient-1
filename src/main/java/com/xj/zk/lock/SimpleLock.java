@@ -1,10 +1,13 @@
 package com.xj.zk.lock;
 
 import com.xj.zk.ZkClient;
+import com.xj.zk.listener.StateListener;
 import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.Watcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
@@ -15,7 +18,7 @@ import java.util.concurrent.TimeUnit;
  */
 public class SimpleLock implements Lock {
     private final static Logger LOGGER = LoggerFactory.getLogger(SimpleLock.class);
-    private final ThreadLocal<String> currentLock = new ThreadLocal<String>();
+    private final ThreadLocal<ReentrantState> currentLock = new ThreadLocal<ReentrantState>();
     private ZkClient client;
     private String lockPath = "/zk/lock/";
     private String seqPath;
@@ -28,19 +31,21 @@ public class SimpleLock implements Lock {
 
     /**
      * 获取锁实例
+     *
      * @return
      */
-    public static SimpleLock getInstance(){
+    public static SimpleLock getInstance() {
         return simpleLock;
     }
 
     /**
      * 初始化
+     *
      * @param client
      * @param path
      */
-    public void init(ZkClient client, String path) {
-        if(isInit){
+    public synchronized void init(ZkClient client, String path) {
+        if (isInit) {
             LOGGER.warn("Repeat init simpleLock.");
             return;
         }
@@ -58,35 +63,66 @@ public class SimpleLock implements Lock {
         if (!client.exists(lockPath)) {
             this.client.create(lockPath, CreateMode.PERSISTENT);
         }
-        lockListener = new LockListener(this.lockPath, this.client);
+        List<String> nodes = client.getChild(this.lockPath, false);
+        lockListener = new LockListener(nodes);
         client.listenChild(this.lockPath, lockListener);
+        client.listenState(Watcher.Event.KeeperState.Expired, new StateListener() {
+            @Override
+            public void listen(Watcher.Event.KeeperState state) {
+                lockListener.interrupt();
+            }
+        });
+        isInit = true;
     }
 
     /**
-     * 等待获得锁的时间
+     * 获得锁，一直等待，该锁不可重入
+     *
+     * @return
+     */
+    public boolean lock() {
+        return this.lock(0);
+    }
+
+    /**
+     * 获得锁，该锁可重入
      *
      * @param timeout 0 或者 大于0的 毫秒数，当设置为0时，程序将一直等待，直到获取到锁，
      *                当设置大于0时，等待获得锁的最长时间为timeout的值
      * @return 是否获取到锁，当超时时返回false
      */
     public boolean lock(long timeout) {
-        final Semaphore lockObj = new Semaphore(0);
-        String newPath = this.client.create(this.seqPath, "".getBytes(), CreateMode.EPHEMERAL_SEQUENTIAL);
-        currentLock.set(newPath);
-        String[] paths = newPath.split("/");
-        final String seq = paths[paths.length - 1];
-        lockListener.addQueue(seq, lockObj);
-        try {
-            boolean islock;
-            if (timeout >= 1) {
-                islock = lockObj.tryAcquire(timeout, TimeUnit.MILLISECONDS);
-            } else {
-                lockObj.acquire();
-                islock = true;
+        ReentrantState state = currentLock.get();
+        if (state == null) {
+            final Semaphore lockObj = new Semaphore(0);
+            BoundSemaphore bs = new BoundSemaphore(Thread.currentThread(), lockObj);
+            String newPath = this.client.create(this.seqPath, "".getBytes(), CreateMode.EPHEMERAL_SEQUENTIAL);
+            state = new ReentrantState(newPath);
+            currentLock.set(state);
+            String[] paths = newPath.split("/");
+            final String seq = paths[paths.length - 1];
+            lockListener.addQueue(seq, bs);
+            boolean islock = false;
+            boolean isException = false;
+            try {
+                if (timeout >= 1) {
+                    islock = lockObj.tryAcquire(timeout, TimeUnit.MILLISECONDS);
+                } else {
+                    lockObj.acquire();
+                    islock = true;
+                }
+                return islock;
+            } catch (InterruptedException e) {
+                isException = true;
+                this.currentLock.remove();
+                throw new LockSessionException("Get lock fail,zookeeper session timeout. " + state.getLockPath());
+            } finally {
+                if (!islock && !isException) {
+                    this.unlock();
+                }
             }
-            return islock;
-        } catch (InterruptedException e) {
-            e.printStackTrace();
+        } else {
+            state.add();
         }
         return false;
     }
@@ -95,7 +131,14 @@ public class SimpleLock implements Lock {
      * 释放锁
      */
     public void unlock() {
-        client.delete(currentLock.get());
+        ReentrantState state = currentLock.get();
+        if (state != null) {
+            int count = state.decrementAndGet();
+            if (count < 1) {
+                client.delete(state.getLockPath());
+                currentLock.remove();
+            }
+        }
     }
 
     /**
